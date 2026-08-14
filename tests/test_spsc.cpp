@@ -43,6 +43,8 @@ void test_capacity_and_wrap_around() {
     assert(q.try_dequeue(val) && val == 5);
     assert(!q.try_dequeue(val));
 
+    assert(q.dropped_count() == 2);
+
     std::cout << "[Test] test_capcity_and_wrap_around passed. \n";
 }
 

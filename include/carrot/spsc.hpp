@@ -61,6 +61,7 @@ namespace carrot {
                         std::this_thread::yield();
                         continue;
                     } else {
+                        m_dropped_count.fetch_add(1, std::memory_order_relaxed);
                         return false;
                     }
                 }
@@ -106,6 +107,10 @@ namespace carrot {
             return true;
         }
 
+        auto dropped_count() const noexcept -> std::size_t {
+            return m_dropped_count.load(std::memory_order_relaxed);
+        }
+
     private:
         struct cell_t {
             alignas(data_T) std::byte m_buffer[sizeof(data_T)];
@@ -121,6 +126,7 @@ namespace carrot {
 
         alignas(cacheline_size) std::atomic_size_t m_write_idx{0};
         alignas(cacheline_size) std::atomic_size_t m_read_idx{0};
+        alignas(cacheline_size) std::atomic_size_t m_dropped_count{0};
         alignas(cacheline_size) std::array<cell_t, Capacity> m_cells;
     };
 
