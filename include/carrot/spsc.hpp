@@ -5,10 +5,18 @@
 #include <bit>
 #include <atomic>
 #include <new>
+#include <memory>
 #include <utility>
+#include <optional>
 
 
 namespace carrot {
+    template<typename T, std::size_t Capacity> class sender;
+    template<typename T, std::size_t Capacity> class receiver;
+    template<typename data_T, std::size_t Capacity> class spsc_queue;
+
+    template<typename T, std::size_t Capacity>
+    auto make_channel() -> std::pair<sender<T, Capacity>, receiver<T, Capacity>>;
 
     template<typename data_T, std::size_t Capacity>
     class spsc_queue {
@@ -88,4 +96,57 @@ namespace carrot {
         alignas(cacheline_size) std::atomic_size_t m_read_idx{0};
         alignas(cacheline_size) std::array<cell_t, Capacity> m_cells;
     };
+
+    template<typename T, std::size_t Capacity>
+    class sender {
+    public:
+        explicit sender(std::shared_ptr<spsc_queue<T, Capacity>> queue)
+            : m_queue(std::move(queue)) {}
+
+        sender(const sender&) = delete;
+        sender& operator=(const sender&) = delete;
+        sender(sender&&) = default;
+        sender& operator=(sender&&) = default;
+
+        auto send(T element) -> bool{
+            if (!m_queue) return false;
+            return m_queue->enqueue(std::move(element));
+        }
+
+    private:
+        std::shared_ptr<spsc_queue<T, Capacity>> m_queue;
+    };
+
+    template<typename T, std::size_t Capacity>
+    class receiver {
+    public:
+        explicit receiver(std::shared_ptr<spsc_queue<T, Capacity>> queue)
+            : m_queue(std::move(queue)) {}
+
+        receiver(const receiver&) = delete;
+        receiver& operator=(const receiver&) = delete;
+        receiver(receiver&&) = default;
+        receiver& operator=(receiver&&) = default;
+
+        auto recv(T& element_out) -> bool {
+            if (!m_queue) return false;
+            return m_queue->try_dequeue(element_out);
+        }
+
+        auto recv() -> std::optional<T> {
+            T val;
+            if (m_queue && m_queue->try_dequeue(val)) {
+                return val;
+            }
+            return std::nullopt;
+        }
+    private:
+        std::shared_ptr<spsc_queue<T, Capacity>> m_queue;
+    };
+
+    template<typename T, std::size_t Capacity>
+    auto make_channel() -> std::pair<sender<T, Capacity>, receiver<T, Capacity>> {
+        auto queue = std::make_shared<spsc_queue<T, Capacity>>();
+        return { sender<T, Capacity>(queue), receiver<T, Capacity>(queue) };
+    }
 }
