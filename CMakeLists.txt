@@ -24,9 +24,9 @@ target_compile_features(carrot-spsc INTERFACE cxx_std_20)
 include(CTest)
 enable_testing()
 
-add_executable(example examples/example.cpp)
+add_executable(spsc_queue_example examples/spsc_queue_example.cpp)
 
-target_link_libraries(example PRIVATE carrot-spsc)
+target_link_libraries(spsc_queue_example PRIVATE carrot-spsc)
 
 add_executable(spsc_test tests/test_spsc.cpp)
 
