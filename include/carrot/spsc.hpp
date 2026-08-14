@@ -8,17 +8,33 @@
 #include <memory>
 #include <utility>
 #include <optional>
+#include <concepts>
 
 
 namespace carrot {
-    template<typename T, std::size_t Capacity> class sender;
-    template<typename T, std::size_t Capacity> class receiver;
-    template<typename data_T, std::size_t Capacity> class spsc_queue;
+    template<typename P>
+    concept full_policy = requires {
+        { P::block_on_full } -> std::convertible_to<bool>;
+    };
+    struct drop_policy {
+        static constexpr bool block_on_full = false;
+    };
 
-    template<typename T, std::size_t Capacity>
-    auto make_channel() -> std::pair<sender<T, Capacity>, receiver<T, Capacity>>;
+    struct spin_policy {
+        static constexpr bool block_on_full = true;
+    };
 
-    template<typename data_T, std::size_t Capacity>
+    static_assert(full_policy<drop_policy>);
+    static_assert(full_policy<spin_policy>);
+
+    template<typename T, std::size_t Capacity, full_policy FullPolicy> class sender;
+    template<typename T, std::size_t Capacity, full_policy FullPolicy> class receiver;
+    template<typename data_T, std::size_t Capacity, full_policy FullPolicy> class spsc_queue;
+
+    template<typename T, std::size_t Capacity, full_policy FullPolicy>
+    auto make_channel() -> std::pair<sender<T, Capacity, FullPolicy>, receiver<T, Capacity, FullPolicy>>;
+
+    template<typename data_T, std::size_t Capacity, full_policy FullPolicy = drop_policy>
     class spsc_queue {
     public:
         static_assert(Capacity >= 2, "Queue capacity must be at least 2");
@@ -36,20 +52,26 @@ namespace carrot {
         spsc_queue& operator=(spsc_queue&&) = delete;
 
         auto enqueue(data_T element) -> bool {
-            const auto current_write = m_write_idx.load(std::memory_order_relaxed);
-            const auto current_read = m_read_idx.load(std::memory_order_acquire);
-
-            if (current_write - current_read >= Capacity) {
-                return false;
+            while (true) {
+                const auto current_write = m_write_idx.load(std::memory_order_relaxed);
+                const auto current_read = m_read_idx.load(std::memory_order_acquire);
+    
+                if (current_write - current_read >= Capacity) {
+                    if constexpr (FullPolicy::block_on_full) {
+                        std::this_thread::yield();
+                        continue;
+                    } else {
+                        return false;
+                    }
+                }
+    
+                const auto slot = current_write & m_mask;
+                ::new (static_cast<void*>(m_cells[slot].m_buffer)) data_T(std::move(element));
+    
+                m_write_idx.store(current_write + 1, std::memory_order_release);
+                return true;
             }
-
-            const auto slot = current_write & m_mask;
-            ::new (static_cast<void*>(m_cells[slot].m_buffer)) data_T(std::move(element));
-
-            m_write_idx.store(current_write + 1, std::memory_order_release);
-            return true;
-
-        };
+        }
 
         auto try_dequeue(data_T& element_out) -> bool {
             const auto current_read = m_read_idx.load(std::memory_order_relaxed);
@@ -66,7 +88,7 @@ namespace carrot {
 
             m_read_idx.store(current_read + 1, std::memory_order_release);
             return true;
-        };
+        }
 
         auto try_discard() -> bool {
             const auto current_read = m_read_idx.load(std::memory_order_relaxed);
@@ -82,7 +104,7 @@ namespace carrot {
 
             m_read_idx.store(current_read + 1, std::memory_order_release);
             return true;
-        };
+        }
 
     private:
         struct cell_t {
@@ -90,14 +112,19 @@ namespace carrot {
         };
 
         static constexpr std::size_t m_mask = Capacity - 1;
-        static constexpr std::size_t cacheline_size = 64;
+
+        #ifdef __cpp_lib_hardware_interference_size
+            static constexpr std::size_t cacheline_size = std::hardware_destructive_interference_size;
+        #else
+            static constexpr std::size_t cacheline_size = 64; // Safe standard fallback for x86/ARM
+        #endif
 
         alignas(cacheline_size) std::atomic_size_t m_write_idx{0};
         alignas(cacheline_size) std::atomic_size_t m_read_idx{0};
         alignas(cacheline_size) std::array<cell_t, Capacity> m_cells;
     };
 
-    template<typename T, std::size_t Capacity>
+    template<typename T, std::size_t Capacity, full_policy FullPolicy = drop_policy>
     class sender {
     public:
         explicit sender(std::shared_ptr<spsc_queue<T, Capacity>> queue)
@@ -117,7 +144,7 @@ namespace carrot {
         std::shared_ptr<spsc_queue<T, Capacity>> m_queue;
     };
 
-    template<typename T, std::size_t Capacity>
+    template<typename T, std::size_t Capacity, full_policy FullPolicy = drop_policy>
     class receiver {
     public:
         explicit receiver(std::shared_ptr<spsc_queue<T, Capacity>> queue)
@@ -144,9 +171,9 @@ namespace carrot {
         std::shared_ptr<spsc_queue<T, Capacity>> m_queue;
     };
 
-    template<typename T, std::size_t Capacity>
-    auto make_channel() -> std::pair<sender<T, Capacity>, receiver<T, Capacity>> {
-        auto queue = std::make_shared<spsc_queue<T, Capacity>>();
-        return { sender<T, Capacity>(queue), receiver<T, Capacity>(queue) };
+    template<typename T, std::size_t Capacity, full_policy FullPolicy>
+    auto make_channel() -> std::pair<sender<T, Capacity, FullPolicy>, receiver<T, Capacity, FullPolicy>> {
+        auto queue = std::make_shared<spsc_queue<T, Capacity, FullPolicy>>();
+        return { sender<T, Capacity, FullPolicy>(queue), receiver<T, Capacity, FullPolicy>(queue) };
     }
 }

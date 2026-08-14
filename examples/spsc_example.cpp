@@ -4,7 +4,7 @@
 #include <carrot/spsc.hpp>
 
 int main() {
-    auto [tx, rx] = carrot::make_channel<int, 1024>();
+    auto [tx, rx] = carrot::make_channel<int, 1024, carrot::drop_policy>();
 
     std::thread producer([tx = std::move(tx)]() mutable {
         for (int i = 0; i < 100; ++i) {
