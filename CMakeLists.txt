@@ -11,8 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 
-add_library(carrot-spsc INTERFACE
-    examples/example.cpp)
+add_library(carrot-spsc INTERFACE)
 
 target_include_directories(carrot-spsc
     INTERFACE
@@ -28,3 +27,9 @@ enable_testing()
 add_executable(example examples/example.cpp)
 
 target_link_libraries(example PRIVATE carrot-spsc)
+
+add_executable(spsc_test tests/test_spsc.cpp)
+
+target_link_libraries(spsc_test PRIVATE carrot-spsc)
+
+add_test(NAME SpscQueueUnitTests COMMAND spsc_test)
