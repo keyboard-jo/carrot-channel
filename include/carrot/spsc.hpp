@@ -24,15 +24,35 @@ namespace carrot {
         static constexpr bool block_on_full = true;
     };
 
+    template<typename P>
+    concept empty_policy = requires {
+        { P::block_on_empty } -> std::convertible_to<bool>;
+    };
+
+    struct poll_policy {
+        static constexpr bool block_on_empty = false;
+    };
+
+    struct wait_policy {
+        static constexpr bool block_on_empty = true;
+    };
+
     static_assert(full_policy<drop_policy>);
     static_assert(full_policy<spin_policy>);
+    static_assert(empty_policy<poll_policy>);
+    static_assert(empty_policy<wait_policy>);
 
-    template<typename T, std::size_t Capacity, full_policy FullPolicy> class sender;
-    template<typename T, std::size_t Capacity, full_policy FullPolicy> class receiver;
+    template<typename C, typename T>
+    concept batch_container = requires(C c, T item) {
+        { c.push_back(std::move(item)) };
+    };
+
+    template<typename T, std::size_t Capacity, full_policy FullPolicy, empty_policy EmptyPolicy> class sender;
+    template<typename T, std::size_t Capacity, full_policy FullPolicy, empty_policy EmptyPolicy> class receiver;
     template<typename data_T, std::size_t Capacity, full_policy FullPolicy> class spsc_queue;
 
-    template<typename T, std::size_t Capacity, full_policy FullPolicy>
-    auto make_channel() -> std::pair<sender<T, Capacity, FullPolicy>, receiver<T, Capacity, FullPolicy>>;
+    template<typename T, std::size_t Capacity, full_policy FullPolicy, empty_policy EmptyPolicy>
+    auto make_channel() -> std::pair<sender<T, Capacity, FullPolicy, EmptyPolicy>, receiver<T, Capacity, FullPolicy, EmptyPolicy>>;
 
     template<typename data_T, std::size_t Capacity, full_policy FullPolicy = drop_policy>
     class spsc_queue {
@@ -74,6 +94,42 @@ namespace carrot {
             }
         }
 
+        template<typename InputIt>
+        requires std::forward_iterator<InputIt> 
+                && std::is_constructible_v<data_T, std::iter_reference_t<InputIt>>
+        auto enqueue_bulk(InputIt first, InputIt last) -> std::size_t {
+            const auto count = std::distance(first, last);
+            if (count <= 0) return 0;
+            const auto ucount = static_cast<std::size_t>(count);
+
+            while (true) {
+                const auto current_write = m_write_idx.load(std::memory_order_relaxed);
+                const auto current_read = m_read_idx.load(std::memory_order_acquire);
+
+                const auto available_space = Capacity - (current_write - current_read);
+
+                if (ucount > available_space) {
+                    if constexpr (FullPolicy::block_on_full) {
+                        std::this_thread::yield();
+                        continue;
+                    } else {
+                        m_dropped_count.fetch_add(ucount, std::memory_order_relaxed);
+                        return false;
+                    }
+                }
+
+                for (std::size_t i = 0; i < ucount; ++i) {
+                    const auto slot = (current_write + i) & m_mask;
+                    ::new (static_cast<void*>(m_cells[slot].m_buffer)) data_T(std::move(*first));
+                    ++first;
+                }
+
+                m_write_idx.store(current_write + ucount, std::memory_order_release);
+                return ucount;
+
+            }
+        }
+
         auto try_dequeue(data_T& element_out) -> bool {
             const auto current_read = m_read_idx.load(std::memory_order_relaxed);
             const auto current_write = m_write_idx.load(std::memory_order_acquire);
@@ -89,6 +145,30 @@ namespace carrot {
 
             m_read_idx.store(current_read + 1, std::memory_order_release);
             return true;
+        }
+
+        template<typename Container>
+        requires batch_container<Container, data_T>
+        auto dequeue_bulk(Container& container, std::size_t max_count) -> std::size_t {
+            const auto current_read = m_read_idx.load(std::memory_order_relaxed);
+            const auto current_write = m_write_idx.load(std::memory_order_acquire);
+
+            if (current_read == current_write || max_count == 0) {
+                return 0;
+            }
+
+            const std::size_t available = current_write - current_read;
+            const std::size_t batch_size = std::min(available, max_count);
+
+            for (std::size_t i = 0; i < batch_size; ++i) {
+                const auto slot = (current_read + i) & m_mask;
+                auto* ptr = reinterpret_cast<data_T*>(m_cells[slot].m_buffer);
+                container.push_back(std::move(*ptr));
+                ptr->~data_T();
+            }
+
+            m_read_idx.store(current_read + batch_size, std::memory_order_release);
+            return batch_size;
         }
 
         auto try_discard() -> bool {
@@ -130,10 +210,10 @@ namespace carrot {
         alignas(cacheline_size) std::array<cell_t, Capacity> m_cells;
     };
 
-    template<typename T, std::size_t Capacity, full_policy FullPolicy = drop_policy>
+    template<typename T, std::size_t Capacity, full_policy FullPolicy, empty_policy EmptyPolicy>
     class sender {
     public:
-        explicit sender(std::shared_ptr<spsc_queue<T, Capacity>> queue)
+        explicit sender(std::shared_ptr<spsc_queue<T, Capacity, FullPolicy>> queue)
             : m_queue(std::move(queue)) {}
 
         sender(const sender&) = delete;
@@ -146,14 +226,26 @@ namespace carrot {
             return m_queue->enqueue(std::move(element));
         }
 
+        template<typename InputIt>
+        requires std::forward_iterator<InputIt> 
+                && std::is_constructible_v<T, std::iter_reference_t<InputIt>>
+        auto send_bulk(InputIt first, InputIt last) -> std::size_t {
+            if (!m_queue) return 0;
+            return m_queue->enqueue_bulk(first, last);
+        }
+
+        auto dropped_count() const noexcept -> std::size_t {
+            return m_queue ? m_queue->dropped_count() : 0;
+        }
+
     private:
         std::shared_ptr<spsc_queue<T, Capacity>> m_queue;
     };
 
-    template<typename T, std::size_t Capacity, full_policy FullPolicy = drop_policy>
+    template<typename T, std::size_t Capacity, full_policy FullPolicy, empty_policy EmptyPolicy>
     class receiver {
     public:
-        explicit receiver(std::shared_ptr<spsc_queue<T, Capacity>> queue)
+        explicit receiver(std::shared_ptr<spsc_queue<T, Capacity, FullPolicy>> queue)
             : m_queue(std::move(queue)) {}
 
         receiver(const receiver&) = delete;
@@ -163,7 +255,17 @@ namespace carrot {
 
         auto recv(T& element_out) -> bool {
             if (!m_queue) return false;
-            return m_queue->try_dequeue(element_out);
+            while (true) {
+                if (m_queue->try_dequeue(element_out)) {
+                    return true;
+                }
+                if constexpr (EmptyPolicy::block_on_empty) {
+                    std::this_thread::yield();
+                    continue;
+                } else {
+                    return false;
+                }
+            }
         }
 
         auto recv() -> std::optional<T> {
@@ -173,13 +275,29 @@ namespace carrot {
             }
             return std::nullopt;
         }
+
+        template<typename Container>
+        requires batch_container<Container, T>
+        auto recv_bulk(Container& container, std::size_t max_count) -> std::size_t {
+            if (!m_queue) return 0;
+            while (true) {
+                const std::size_t fetched = m_queue->dequeue_bulk(container, max_count);
+                if (fetched > 0 || !EmptyPolicy::block_on_empty) {
+                    return fetched;
+                }
+                std::this_thread::yield();
+            }
+        }
     private:
         std::shared_ptr<spsc_queue<T, Capacity>> m_queue;
     };
 
-    template<typename T, std::size_t Capacity, full_policy FullPolicy>
-    auto make_channel() -> std::pair<sender<T, Capacity, FullPolicy>, receiver<T, Capacity, FullPolicy>> {
+    template<typename T, std::size_t Capacity, full_policy FullPolicy, empty_policy EmptyPolicy>
+    auto make_channel() -> std::pair<sender<T, Capacity, FullPolicy, EmptyPolicy>, receiver<T, Capacity, FullPolicy, EmptyPolicy>> {
         auto queue = std::make_shared<spsc_queue<T, Capacity, FullPolicy>>();
-        return { sender<T, Capacity, FullPolicy>(queue), receiver<T, Capacity, FullPolicy>(queue) };
+        return { 
+            sender<T, Capacity, FullPolicy, EmptyPolicy>(queue), 
+            receiver<T, Capacity, FullPolicy, EmptyPolicy>(queue) 
+        };
     }
 }
